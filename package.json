@@ -19,5 +19,8 @@
     "jsonwebtoken": "^9.0.2",
     "moment-timezone": "^0.6.0",
     "mongodb": "^6.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.2.0"
   }
 }

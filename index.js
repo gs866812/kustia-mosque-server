@@ -77,12 +77,107 @@ async function run() {
         const incomeCategoriesCollections = db.collection("incomeCategoriesList");
         const expenseCategoriesCollections = db.collection("expenseCategoriesList");
         const hadithCollections = db.collection("hadithList");
+        const addressCollections = db.collection("addressList");
+        const unitCollections = db.collection("unitList");
+        const referenceCollections = db.collection("referenceList");
 
         // **************************************************************************************************
         // **************************************************************************************************
+        // __________________________________________________________________________________________________
+        // all post api
+        app.post("/submitDonation", async (req, res) => {
+            try {
+                let donation = req.body;
+                donation.amount = Number(donation.amount) || 0;
+                donation.quantity = Number(donation.quantity) || 0;
+                // -----------------------------------------------------------------------------------------
+                const isAddress = await addressCollections.findOne({ address: donation.address });
+                if(!isAddress) {
+                    await addressCollections.insertOne({ address: donation.address });
+                }
+                const isCategory = await incomeCategoriesCollections.findOne({ category: donation.incomeCategory });
+                if(!isCategory) {
+                    await incomeCategoriesCollections.insertOne({ category: donation.incomeCategory });
+                }
+                const isUnit = await unitCollections.findOne({ unit: donation.unit || "None" });
+                if(!isUnit) {
+                    await unitCollections.insertOne({ unit: donation.unit });
+                }
+                const isReference = await referenceCollections.findOne({ reference: donation.reference });
+                if(!isReference) {
+                    await referenceCollections.insertOne({ reference: donation.reference });
+                }
+                // -----------------------------------------------------------------------------------------
 
+                if (!donation.donorId) {
+                    // If donorId not provided, auto-generate it
+                    const lastDonor = await donorCollections
+                        .find({ donorId: { $exists: true } })
+                        .sort({ donorId: -1 })
+                        .limit(1)
+                        .toArray();
 
+                    const lastId = lastDonor?.[0]?.donorId || 10;
+                    donation.donorId = lastId + 1;
 
+                    await donorCollections.insertOne({
+                        donorId: donation.donorId,
+                        donorName: donation.donorName,
+                        donorAddress: donation.address,
+                        donorContact: donation.phone,
+                        donateAmount: donation?.amount || 0,
+                    });
+                } else {
+                    // Make sure donorID is a number
+                    donation.donorId = Number(donation.donorId) || 0;
+                    await donorCollections.updateOne(
+                        { donorId: donation.donorId },
+                        { $inc: { donateAmount: donation?.amount || 0 } },
+                    )
+                }
+
+                const result = await donationCollections.insertOne(donation);
+                res.send(result);
+            } catch (error) {
+                console.error("Submit Donation Error:", error);
+                res.status(500).send({ message: "Internal server error" });
+            }
+        });
+
+        // ___________________________________________________________________________________________________
+
+        // **************************************************************************************************
+        // All get api
+        // ___________________________________________________________________________________________________
+        app.get("/getDonorId/:id", verifyToken, async (req, res) => {
+            const userEmailFromToken = req.user.email;
+            const emailQuery = req.query.email;
+
+            if (userEmailFromToken !== emailQuery) {
+                return res.status(403).send({ message: "Forbidden Access" });
+            }
+
+            const donorId = parseInt(req.params.id);
+
+            if (isNaN(donorId)) {
+                return res.json({ message: "Invalid ID" });
+            }
+
+            try {
+                const donor = await donorCollections.findOne({ donorId });
+                if (!donor) return res.json({ message: "Donor not found" });
+
+                res.send({
+                    donorName: donor.donorName,
+                    address: donor.donorAddress,
+                    phone: donor.donorContact,
+                });
+            } catch (error) {
+                // console.error("Get Donor Error:", error);
+                res.json({ message: "Server error" });
+            }
+        });
+        // ____________________________________________________________________________________________________
 
         // **************************************************************************************************
         // **************************************************************************************************
