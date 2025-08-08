@@ -79,7 +79,9 @@ async function run() {
         const hadithCollections = db.collection("hadithList");
         const addressCollections = db.collection("addressList");
         const unitCollections = db.collection("unitList");
+        const expenseUnitCollections = db.collection("expenseUnitList");
         const referenceCollections = db.collection("referenceList");
+        const expenseReferenceCollections = db.collection("expenseReferenceList");
 
         // **************************************************************************************************
         // **************************************************************************************************
@@ -92,19 +94,19 @@ async function run() {
                 donation.quantity = Number(donation.quantity) || 0;
                 // -----------------------------------------------------------------------------------------
                 const isAddress = await addressCollections.findOne({ address: donation.address });
-                if(!isAddress) {
+                if (!isAddress) {
                     await addressCollections.insertOne({ address: donation.address });
                 }
                 const isCategory = await incomeCategoriesCollections.findOne({ category: donation.incomeCategory });
-                if(!isCategory) {
+                if (!isCategory) {
                     await incomeCategoriesCollections.insertOne({ category: donation.incomeCategory });
                 }
                 const isUnit = await unitCollections.findOne({ unit: donation.unit || "None" });
-                if(!isUnit) {
+                if (!isUnit) {
                     await unitCollections.insertOne({ unit: donation.unit });
                 }
                 const isReference = await referenceCollections.findOne({ reference: donation.reference });
-                if(!isReference) {
+                if (!isReference) {
                     await referenceCollections.insertOne({ reference: donation.reference });
                 }
                 // -----------------------------------------------------------------------------------------
@@ -143,6 +145,35 @@ async function run() {
                 res.status(500).send({ message: "Internal server error" });
             }
         });
+        // ___________________________________________________________________________________________________
+        app.post("/submitExpense", async (req, res) => {
+            try {
+                let expense = req.body;
+                expense.amount = Number(expense.amount) || 0;
+                // -----------------------------------------------------------------------------------------
+                const isCategory = await expenseCategoriesCollections.findOne({ category: expense.expenseCategory });
+                if (!isCategory) {
+                    await expenseCategoriesCollections.insertOne({ category: expense.expenseCategory });
+                }
+
+                const isUnit = await expenseUnitCollections.findOne({ unit: expense.unit || "None" });
+                if (!isUnit) {
+                    await expenseUnitCollections.insertOne({ unit: expense.unit });
+                }
+
+                const isReference = await expenseReferenceCollections.findOne({ reference: expense.reference });
+                if( !isReference) {
+                    await expenseReferenceCollections.insertOne({ reference: expense.reference });
+                }
+                // -----------------------------------------------------------------------------------------
+
+                const result = await expenseCollections.insertOne(expense);
+                res.send(result);
+            } catch (error) {
+                console.error("Submit Expense Error:", error);
+                res.json({ message: "Internal server error" });
+            }
+        });
 
         // ___________________________________________________________________________________________________
 
@@ -177,6 +208,44 @@ async function run() {
                 res.json({ message: "Server error" });
             }
         });
+        // ____________________________________________________________________________________________________
+        app.get("/getInfo", verifyToken, async (req, res) => {
+            const userEmailFromToken = req.user?.email;
+            const emailQuery = req.query?.email;
+
+            if (!userEmailFromToken || !emailQuery) {
+                return res.status(400).send({ message: "Email is required" });
+            }
+
+            if (userEmailFromToken !== emailQuery) {
+                return res.status(403).send({ message: "Forbidden Access" });
+            }
+
+            try {
+                const address = await addressCollections.find().toArray();
+                const incomeCategories = await incomeCategoriesCollections.find().toArray();
+                const unit = await unitCollections.find().toArray();
+                const reference = await referenceCollections.find().toArray();
+
+                const expenseCategory = await expenseCategoriesCollections.find().toArray();
+                const expenseUnit = await expenseUnitCollections.find().toArray();
+                const expenseReference = await expenseReferenceCollections.find().toArray();
+
+                res.send({
+                    address: address.map(a => a.address),
+                    incomeCategories: incomeCategories.map(c => c.category),
+                    unit: unit.map(u => u.unit),
+                    reference: reference.map(r => r.reference),
+                    expenseCategory: expenseCategory.map(c => c.category),
+                    expenseUnit: expenseUnit.map(u => u.unit),
+                    expenseReference: expenseReference.map(r => r.reference),
+                });
+            } catch (error) {
+                console.error(error);
+                res.status(500).send({ message: "Internal server error" });
+            }
+        });
+
         // ____________________________________________________________________________________________________
 
         // **************************************************************************************************
