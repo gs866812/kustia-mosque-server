@@ -3,7 +3,7 @@ const jwt = require("jsonwebtoken");
 const bodyParser = require("body-parser");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
-const { MongoClient, ServerApiVersion } = require("mongodb");
+const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 require("dotenv").config();
 // **************************************************************************************************
 const app = express();
@@ -162,7 +162,7 @@ async function run() {
                 }
 
                 const isReference = await expenseReferenceCollections.findOne({ reference: expense.reference });
-                if( !isReference) {
+                if (!isReference) {
                     await expenseReferenceCollections.insertOne({ reference: expense.reference });
                 }
                 // -----------------------------------------------------------------------------------------
@@ -175,6 +175,17 @@ async function run() {
             }
         });
 
+        // ___________________________________________________________________________________________________
+        app.post("/addHadith", async (req, res) => {
+            try {
+                const hadith = req.body;
+                const result = await hadithCollections.insertOne(hadith);
+                res.send(result);
+
+            } catch (error) {
+                res.json({ message: "Internal server error" });
+            }
+        });
         // ___________________________________________________________________________________________________
 
         // **************************************************************************************************
@@ -246,6 +257,166 @@ async function run() {
             }
         });
 
+        // ____________________________________________________________________________________________________
+        app.get("/hadithList", verifyToken, async (req, res) => {
+            const userEmailFromToken = req.user?.email;
+            const emailQuery = req.query?.email;
+            const search = req.query?.search || "";
+            const page = parseInt(req.query?.page) || 1;
+            const limit = parseInt(req.query?.limit) || 10;
+
+            if (!userEmailFromToken || !emailQuery) {
+                return res.status(400).send({ message: "Email is required" });
+            }
+
+            if (userEmailFromToken !== emailQuery) {
+                return res.status(403).send({ message: "Forbidden Access" });
+            }
+
+            try {
+                const escapedSearch = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                const query = {
+                    $or: [
+                        { hadith: { $regex: escapedSearch, $options: "i" } },
+                        { date: { $regex: escapedSearch, $options: "i" } },
+                    ]
+                };
+
+                const total = await hadithCollections.countDocuments(query);
+
+                const hadithList = await hadithCollections
+                    .find(query)
+                    .skip((page - 1) * limit)
+                    .limit(limit)
+                    .toArray();
+
+                res.send({
+                    total,
+                    data: hadithList
+                });
+            } catch (error) {
+                console.error(error);
+                res.status(500).json({ message: "Internal server error" });
+            }
+        });
+
+
+        // ____________________________________________________________________________________________________
+        app.get("/getFullHadithList", verifyToken, async (req, res) => {
+            const userEmailFromToken = req.user?.email;
+            const emailQuery = req.query?.email;
+
+
+            if (!userEmailFromToken || !emailQuery) {
+                return res.status(400).send({ message: "Email is required" });
+            }
+
+            if (userEmailFromToken !== emailQuery) {
+                return res.status(403).send({ message: "Forbidden Access" });
+            }
+
+            try {
+
+                const hadithList = await hadithCollections.find().toArray();
+                res.send(hadithList);
+            } catch (error) {
+                console.error(error);
+                res.json({ message: "Internal server error" });
+            }
+        });
+
+        // ____________________________________________________________________________________________________
+        app.get("/donationList", verifyToken, async (req, res) => {
+            const userEmailFromToken = req.user?.email;
+            const emailQuery = req.query?.email;
+            if (!userEmailFromToken || !emailQuery) {
+                return res.status(400).send({ message: "Email is required" });
+            }
+            if (userEmailFromToken !== emailQuery) {
+                return res.status(403).send({ message: "Forbidden Access" });
+            }
+            try {
+                const donationList = await donationCollections.find().toArray();
+                res.send(donationList);
+            } catch (error) {
+                console.error("Get Donation List Error:", error);
+                res.json({ message: "Internal server error" });
+            }
+        });
+        // ____________________________________________________________________________________________________
+        app.get("/expenseList", verifyToken, async (req, res) => {
+            const userEmailFromToken = req.user?.email;
+            const emailQuery = req.query?.email;
+            if (!userEmailFromToken || !emailQuery) {
+                return res.status(400).send({ message: "Email is required" });
+            }
+            if (userEmailFromToken !== emailQuery) {
+                return res.status(403).send({ message: "Forbidden Access" });
+            }
+            try {
+                const expenseList = await expenseCollections.find().toArray();
+                res.send(expenseList);
+            } catch (error) {
+                console.error("Get expense List Error:", error);
+                res.json({ message: "Internal server error" });
+            }
+        });
+        // ____________________________________________________________________________________________________
+        app.delete("/hadith/:id", verifyToken, async (req, res) => {
+            const userEmailFromToken = req.user?.email;
+            const emailQuery = req.query?.email;
+            if (!userEmailFromToken || !emailQuery) {
+                return res.status(400).send({ message: "Email is required" });
+            }
+            if (userEmailFromToken !== emailQuery) {
+                return res.status(403).send({ message: "Forbidden Access" });
+            }
+            const id = req.params.id;
+            if (!id) {
+                return res.status(400).send({ message: "ID is required" });
+            }
+            try {
+                const result = await hadithCollections.deleteOne({ _id: new ObjectId(id) });
+                if (result.deletedCount === 0) {
+                    return res.status(404).send({ message: "Hadith not found" });
+                }
+                res.send(result);
+            } catch (error) {
+                console.error("Delete Hadith Error:", error);
+                res.status(500).send({ message: "Internal server error" });
+            }
+        });
+        // ____________________________________________________________________________________________________
+        app.put("/editHadith/:id", verifyToken, async (req, res) => {
+            const hadithId = req.params.id;
+            const { hadith, email } = req.body;
+            console.log(hadith, email);
+            const userEmailFromToken = req.user?.email;
+
+            if (!userEmailFromToken || !email) {
+                return res.status(400).send({ message: "Email is required" });
+            }
+
+            if (userEmailFromToken !== email) {
+                return res.status(403).send({ message: "Forbidden Access" });
+            }
+
+            if (!hadith || hadith.trim() === "") {
+                return res.status(400).send({ message: "Hadith text is required" });
+            }
+
+            try {
+                const result = await hadithCollections.updateOne(
+                    { _id: new ObjectId(hadithId) },
+                    { $set: { hadith: hadith } }
+                );
+
+                res.send(result); // result.modifiedCount will be checked by frontend
+            } catch (error) {
+                console.error("Error updating hadith:", error);
+                res.status(500).send({ message: "Internal server error" });
+            }
+        });
         // ____________________________________________________________________________________________________
 
         // **************************************************************************************************
