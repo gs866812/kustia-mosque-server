@@ -4,6 +4,7 @@ const bodyParser = require("body-parser");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+const moment = require('moment-timezone');
 require("dotenv").config();
 // **************************************************************************************************
 const app = express();
@@ -302,18 +303,7 @@ async function run() {
 
 
         // ____________________________________________________________________________________________________
-        app.get("/getFullHadithList", verifyToken, async (req, res) => {
-            const userEmailFromToken = req.user?.email;
-            const emailQuery = req.query?.email;
-
-
-            if (!userEmailFromToken || !emailQuery) {
-                return res.status(400).send({ message: "Email is required" });
-            }
-
-            if (userEmailFromToken !== emailQuery) {
-                return res.status(403).send({ message: "Forbidden Access" });
-            }
+        app.get("/getFullHadithList", async (req, res) => {
 
             try {
 
@@ -326,39 +316,283 @@ async function run() {
         });
 
         // ____________________________________________________________________________________________________
-        app.get("/donationList", verifyToken, async (req, res) => {
+        // Get distinct income categories
+        app.get("/donationCategories", verifyToken, async (req, res) => {
             const userEmailFromToken = req.user?.email;
             const emailQuery = req.query?.email;
+
             if (!userEmailFromToken || !emailQuery) {
                 return res.status(400).send({ message: "Email is required" });
             }
             if (userEmailFromToken !== emailQuery) {
                 return res.status(403).send({ message: "Forbidden Access" });
             }
+
             try {
-                const donationList = await donationCollections.find().toArray();
-                res.send(donationList);
+                // distinct returns an array
+                const categories = await donationCollections.distinct("incomeCategory", {
+                    incomeCategory: { $exists: true, $ne: "" },
+                });
+
+                // Optional: sort nicely (Bangla-friendly)
+                const sorted = categories
+                    .filter(Boolean)
+                    .sort((a, b) => String(a).localeCompare(String(b), "bn"));
+
+                res.send(sorted);
             } catch (error) {
-                console.error("Get Donation List Error:", error);
-                res.json({ message: "Internal server error" });
+                console.error("Get Donation Categories Error:", error);
+                res.status(500).json({ message: "Internal server error" });
             }
         });
+
+        // ____________________________________________________________________________________________________
+        app.get("/donationList", verifyToken, async (req, res) => {
+            const userEmailFromToken = req.user?.email;
+            const emailQuery = req.query?.email;
+
+            if (!userEmailFromToken || !emailQuery) {
+                return res.status(400).send({ message: "Email is required" });
+            }
+            if (userEmailFromToken !== emailQuery) {
+                return res.status(403).send({ message: "Forbidden Access" });
+            }
+
+            try {
+                let {
+                    search = "",
+                    category = "",
+                    startDate = "",
+                    endDate = "",
+                    page = 1,
+                    limit = 10
+                } = req.query;
+
+                page = parseInt(page);
+                limit = parseInt(limit);
+
+                const query = {};
+
+                // --- SEARCH ---
+                // Covers strings & numbers; date is stored as string like "11.Aug.2025"
+                if (search) {
+                    const num = Number(search);
+                    const isNum = !isNaN(num);
+
+                    const or = [
+                        { donorName: { $regex: search, $options: "i" } },
+                        { address: { $regex: search, $options: "i" } },
+                        { incomeCategory: { $regex: search, $options: "i" } },
+                        { reference: { $regex: search, $options: "i" } },
+                        { phone: { $regex: search, $options: "i" } },
+                        { paymentOption: { $regex: search, $options: "i" } },
+                        { unit: { $regex: search, $options: "i" } },
+                        { month: { $regex: search, $options: "i" } },
+                        { year: { $regex: search, $options: "i" } },
+                        // date string search (e.g., "11.Aug.2025" or even "Aug")
+                        { date: { $regex: search, $options: "i" } },
+                    ];
+
+                    if (isNum) {
+                        or.push({ donorId: num });
+                        or.push({ amount: num });
+                        or.push({ quantity: num });
+                    }
+
+                    query.$or = or;
+                }
+
+                // --- CATEGORY FILTER ---
+                if (category) {
+                    query.incomeCategory = category;
+                }
+
+                // --- DATE RANGE (INCLUSIVE END) ---
+                // Frontend sends ISO strings; we'll convert to Date and include full end-day.
+                if (startDate && endDate) {
+                    const start = new Date(startDate);
+                    const end = new Date(endDate);
+                    end.setHours(23, 59, 59, 999); // inclusive
+
+                    // Your DB date is a string "DD.MMM.YYYY", parse inside query
+                    query.$expr = {
+                        $and: [
+                            {
+                                $gte: [
+                                    {
+                                        $dateFromString: {
+                                            dateString: "$date",
+                                            format: "%d.%b.%Y",
+                                            onError: new Date(0),
+                                        }
+                                    },
+                                    start
+                                ]
+                            },
+                            {
+                                $lte: [
+                                    {
+                                        $dateFromString: {
+                                            dateString: "$date",
+                                            format: "%d.%b.%Y",
+                                            onError: new Date(0),
+                                        }
+                                    },
+                                    end
+                                ]
+                            }
+                        ]
+                    };
+                }
+
+                // Totals over full filtered set (not just current page)
+                const totals = await donationCollections.aggregate([
+                    { $match: query },
+                    {
+                        $group: {
+                            _id: null,
+                            totalAmount: { $sum: { $ifNull: ["$amount", 0] } },
+                            totalQuantity: { $sum: { $ifNull: ["$quantity", 0] } },
+                            count: { $sum: 1 }
+                        }
+                    }
+                ]).toArray();
+
+                const totalAmount = totals[0]?.totalAmount || 0;
+                const totalQuantity = totals[0]?.totalQuantity || 0;
+                const totalCount = totals[0]?.count || 0;
+
+                // Page data
+                const data = await donationCollections
+                    .find(query)
+                    .sort({ _id: -1 })
+                    .skip((page - 1) * limit)
+                    .limit(limit)
+                    .toArray();
+
+                res.send({ data, totalAmount, totalQuantity, totalCount });
+            } catch (error) {
+                console.error("Get Donation List Error:", error);
+                res.status(500).json({ message: "Internal server error" });
+            }
+        });
+
+
         // ____________________________________________________________________________________________________
         app.get("/expenseList", verifyToken, async (req, res) => {
             const userEmailFromToken = req.user?.email;
             const emailQuery = req.query?.email;
+
             if (!userEmailFromToken || !emailQuery) {
                 return res.status(400).send({ message: "Email is required" });
             }
             if (userEmailFromToken !== emailQuery) {
                 return res.status(403).send({ message: "Forbidden Access" });
             }
+
             try {
-                const expenseList = await expenseCollections.find().toArray();
-                res.send(expenseList);
-            } catch (error) {
-                console.error("Get expense List Error:", error);
-                res.json({ message: "Internal server error" });
+                let {
+                    search = "",
+                    category = "",
+                    startDate = "",
+                    endDate = "",
+                    page = 1,
+                    limit = 10
+                } = req.query;
+
+                page = parseInt(page);
+                limit = parseInt(limit);
+
+                const query = {};
+
+                if (search) {
+                    const num = Number(search);
+                    const isNum = !isNaN(num);
+
+                    const or = [
+                        { expense: { $regex: search, $options: "i" } },
+                        { expenseCategory: { $regex: search, $options: "i" } },
+                        { reference: { $regex: search, $options: "i" } },
+                        { note: { $regex: search, $options: "i" } },
+                        { unit: { $regex: search, $options: "i" } },
+                        { date: { $regex: search, $options: "i" } }, // "07.Aug.2025"
+                        { month: { $regex: search, $options: "i" } },
+                        { year: { $regex: search, $options: "i" } },
+                    ];
+
+                    if (isNum) {
+                        or.push({ amount: num });
+                        or.push({ quantity: num });
+                    }
+                    query.$or = or;
+                }
+
+                if (category) {
+                    query.expenseCategory = category;
+                }
+
+                if (startDate && endDate) {
+                    const start = new Date(startDate);
+                    const end = new Date(endDate);
+                    end.setHours(23, 59, 59, 999); // inclusive end
+
+                    query.$expr = {
+                        $and: [
+                            {
+                                $gte: [
+                                    {
+                                        $dateFromString: {
+                                            dateString: "$date",
+                                            format: "%d.%b.%Y",
+                                            onError: new Date(0),
+                                        }
+                                    },
+                                    start
+                                ]
+                            },
+                            {
+                                $lte: [
+                                    {
+                                        $dateFromString: {
+                                            dateString: "$date",
+                                            format: "%d.%b.%Y",
+                                            onError: new Date(0),
+                                        }
+                                    },
+                                    end
+                                ]
+                            }
+                        ]
+                    };
+                }
+
+                const totals = await expenseCollections.aggregate([
+                    { $match: query },
+                    {
+                        $group: {
+                            _id: null,
+                            totalAmount: { $sum: { $ifNull: ["$amount", 0] } },
+                            totalQuantity: { $sum: { $ifNull: ["$quantity", 0] } },
+                            count: { $sum: 1 }
+                        }
+                    }
+                ]).toArray();
+
+                const totalAmount = totals[0]?.totalAmount || 0;
+                const totalQuantity = totals[0]?.totalQuantity || 0;
+                const totalCount = totals[0]?.count || 0;
+
+                const data = await expenseCollections
+                    .find(query)
+                    .sort({ _id: -1 })
+                    .skip((page - 1) * limit)
+                    .limit(limit)
+                    .toArray();
+
+                res.send({ data, totalAmount, totalQuantity, totalCount });
+            } catch (err) {
+                console.error("Get Expense List Error:", err);
+                res.status(500).json({ message: "Internal server error" });
             }
         });
         // ____________________________________________________________________________________________________
@@ -383,6 +617,31 @@ async function run() {
                 res.send(result);
             } catch (error) {
                 console.error("Delete Hadith Error:", error);
+                res.status(500).send({ message: "Internal server error" });
+            }
+        });
+        // ____________________________________________________________________________________________________
+        app.delete("/deleteDonation/:id", verifyToken, async (req, res) => {
+            const userEmailFromToken = req.user?.email;
+            const emailQuery = req.query?.email;
+            if (!userEmailFromToken || !emailQuery) {
+                return res.status(400).send({ message: "Email is required" });
+            }
+            if (userEmailFromToken !== emailQuery) {
+                return res.status(403).send({ message: "Forbidden Access" });
+            }
+            const id = req.params.id;
+            if (!id) {
+                return res.status(400).send({ message: "ID is required" });
+            }
+            try {
+                const result = await donationCollections.deleteOne({ _id: new ObjectId(id) });
+                if (result.deletedCount === 0) {
+                    return res.status(404).send({ message: "data not found" });
+                }
+                res.send(result);
+            } catch (error) {
+                console.error("Delete donation Error:", error);
                 res.status(500).send({ message: "Internal server error" });
             }
         });
@@ -415,6 +674,155 @@ async function run() {
             } catch (error) {
                 console.error("Error updating hadith:", error);
                 res.status(500).send({ message: "Internal server error" });
+            }
+        });
+        // ____________________________________________________________________________________________________
+        // PUT: update a donation
+        app.put("/updateDonation/:id", verifyToken, async (req, res) => {
+            const { id } = req.params;
+            const userEmailFromToken = req.user?.email;
+            const emailQuery = req.query?.email;
+
+            if (!userEmailFromToken || !emailQuery) {
+                return res.status(400).send({ message: "Email is required" });
+            }
+            if (userEmailFromToken !== emailQuery) {
+                return res.status(403).send({ message: "Forbidden Access" });
+            }
+
+            try {
+                const {
+                    date,           // "DD.MMM.YYYY"
+                    amount,
+                    quantity,
+                    incomeCategory,
+                    reference
+                } = req.body || {};
+
+                const $set = {};
+
+                // date (strict parse + tz) + keep schema in sync
+                if (typeof date === "string" && date.trim() !== "") {
+                    const m = moment(date, "DD.MMM.YYYY", true).tz("Asia/Dhaka");
+                    if (!m.isValid()) {
+                        return res.status(400).send({
+                            message: "Invalid date format. Use DD.MMM.YYYY (e.g., 07.Aug.2025)"
+                        });
+                    }
+                    $set.date = m.format("DD.MMM.YYYY");
+                    $set.month = m.format("MMMM"); // e.g., "August"
+                    $set.year = m.format("YYYY");  // e.g., "2025"
+                }
+
+                // amount
+                if (amount !== undefined) {
+                    const num = Number(amount);
+                    if (!Number.isFinite(num) || num < 0) {
+                        return res.status(400).send({ message: "Invalid amount" });
+                    }
+                    $set.amount = num;
+                }
+
+                // quantity
+                if (quantity !== undefined) {
+                    const numQ = Number(quantity);
+                    if (!Number.isFinite(numQ) || numQ < 0) {
+                        return res.status(400).send({ message: "Invalid quantity" });
+                    }
+                    $set.quantity = numQ;
+                }
+
+                if (incomeCategory !== undefined) $set.incomeCategory = String(incomeCategory);
+                if (reference !== undefined) $set.reference = String(reference);
+
+                if (Object.keys($set).length === 0) {
+                    return res.status(400).send({ message: "No valid fields to update" });
+                }
+
+                $set.updatedAt = new Date();
+
+                const result = await donationCollections.updateOne(
+                    { _id: new ObjectId(id) },
+                    { $set }
+                );
+
+                return res.send({ modifiedCount: result.modifiedCount });
+            } catch (err) {
+                console.error("Update Donation Error:", err);
+                return res.status(500).json({ message: "Internal server error" });
+            }
+        });
+
+        // ____________________________________________________________________________________________________
+        // PUT: update an expense
+        app.put("/updateExpense/:id", verifyToken, async (req, res) => {
+            const { id } = req.params;
+            const userEmailFromToken = req.user?.email;
+            const emailQuery = req.query?.email;
+
+            if (!userEmailFromToken || !emailQuery) {
+                return res.status(400).send({ message: "Email is required" });
+            }
+            if (userEmailFromToken !== emailQuery) {
+                return res.status(403).send({ message: "Forbidden Access" });
+            }
+
+            try {
+                const {
+                    date,              // "DD.MMM.YYYY"
+                    expense,           // string
+                    amount,            // number
+                    quantity,          // number
+                    expenseCategory,   // string
+                    reference,         // string
+                    note               // string
+                } = req.body || {};
+
+                const $set = {};
+
+                if (typeof date === "string" && date.trim() !== "") {
+                    const m = moment(date, "DD.MMM.YYYY", true).tz("Asia/Dhaka");
+                    if (!m.isValid()) {
+                        return res.status(400).send({ message: "Invalid date format. Use DD.MMM.YYYY (e.g., 07.Aug.2025)" });
+                    }
+                    $set.date = m.format("DD.MMM.YYYY");
+                    $set.month = m.format("MMMM");
+                    $set.year = m.format("YYYY");
+                }
+
+                if (expense !== undefined) $set.expense = String(expense);
+
+                if (amount !== undefined) {
+                    const num = Number(amount);
+                    if (!Number.isFinite(num) || num < 0) return res.status(400).send({ message: "Invalid amount" });
+                    $set.amount = num;
+                }
+
+                if (quantity !== undefined) {
+                    const numQ = Number(quantity);
+                    if (!Number.isFinite(numQ) || numQ < 0) return res.status(400).send({ message: "Invalid quantity" });
+                    $set.quantity = numQ;
+                }
+
+                if (expenseCategory !== undefined) $set.expenseCategory = String(expenseCategory);
+                if (reference !== undefined) $set.reference = String(reference);
+                if (note !== undefined) $set.note = String(note);
+
+                if (Object.keys($set).length === 0) {
+                    return res.status(400).send({ message: "No valid fields to update" });
+                }
+
+                $set.updatedAt = new Date();
+
+                const result = await expenseCollections.updateOne(
+                    { _id: new ObjectId(id) },
+                    { $set }
+                );
+
+                res.send({ modifiedCount: result.modifiedCount });
+            } catch (err) {
+                console.error("Update Expense Error:", err);
+                res.status(500).json({ message: "Internal server error" });
             }
         });
         // ____________________________________________________________________________________________________
