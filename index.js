@@ -596,6 +596,142 @@ async function run() {
             }
         });
         // ____________________________________________________________________________________________________
+        // ===== PUBLIC DONATIONS (list + totals) =====
+        app.get("/public/donationList", async (req, res) => {
+            try {
+                let { search = "", category = "", startDate = "", endDate = "", page = 1, limit = 10 } = req.query;
+                page = parseInt(page); limit = parseInt(limit);
+
+                const query = {};
+
+                if (search) {
+                    const num = Number(search);
+                    const isNum = !isNaN(num);
+                    const or = [
+                        { donorName: { $regex: search, $options: "i" } },
+                        { address: { $regex: search, $options: "i" } },
+                        { incomeCategory: { $regex: search, $options: "i" } },
+                        { reference: { $regex: search, $options: "i" } },
+                        { date: { $regex: search, $options: "i" } },
+                        { month: { $regex: search, $options: "i" } },
+                        { year: { $regex: search, $options: "i" } },
+                    ];
+                    if (isNum) { or.push({ amount: num }); or.push({ quantity: num }); or.push({ donorId: num }); }
+                    query.$or = or;
+                }
+                if (category) query.incomeCategory = category;
+
+                if (startDate && endDate) {
+                    const start = new Date(startDate);
+                    const end = new Date(endDate); end.setHours(23, 59, 59, 999);
+                    query.$expr = {
+                        $and: [
+                            { $gte: [{ $dateFromString: { dateString: "$date", format: "%d.%b.%Y", onError: new Date(0) } }, start] },
+                            { $lte: [{ $dateFromString: { dateString: "$date", format: "%d.%b.%Y", onError: new Date(0) } }, end] },
+                        ],
+                    };
+                }
+
+                const totals = await donationCollections.aggregate([
+                    { $match: query },
+                    { $group: { _id: null, totalAmount: { $sum: { $ifNull: ["$amount", 0] } }, totalQuantity: { $sum: { $ifNull: ["$quantity", 0] } }, count: { $sum: 1 } } }
+                ]).toArray();
+
+                const totalAmount = totals[0]?.totalAmount || 0;
+                const totalQuantity = totals[0]?.totalQuantity || 0;
+                const totalCount = totals[0]?.count || 0;
+
+                const data = await donationCollections
+                    .find(query, { projection: { donorName: 1, address: 1, amount: 1 } }) // only what the UI needs
+                    .sort({ _id: -1 })
+                    .skip((page - 1) * limit)
+                    .limit(limit)
+                    .toArray();
+
+                res.send({ data, totalAmount, totalQuantity, totalCount });
+            } catch (err) {
+                console.error("Public Donation List Error:", err);
+                res.status(500).json({ message: "Internal server error" });
+            }
+        });
+
+        // ===== PUBLIC EXPENSES (list + totals) =====
+        app.get("/public/expenseList", async (req, res) => {
+            try {
+                let { search = "", category = "", startDate = "", endDate = "", page = 1, limit = 10 } = req.query;
+                page = parseInt(page); limit = parseInt(limit);
+
+                const query = {};
+
+                if (search) {
+                    const num = Number(search);
+                    const isNum = !isNaN(num);
+                    const or = [
+                        { expense: { $regex: search, $options: "i" } },
+                        { expenseCategory: { $regex: search, $options: "i" } },
+                        { reference: { $regex: search, $options: "i" } },
+                        { note: { $regex: search, $options: "i" } },
+                        { unit: { $regex: search, $options: "i" } },
+                        { date: { $regex: search, $options: "i" } },
+                        { month: { $regex: search, $options: "i" } },
+                        { year: { $regex: search, $options: "i" } },
+                    ];
+                    if (isNum) { or.push({ amount: num }); or.push({ quantity: num }); }
+                    query.$or = or;
+                }
+                if (category) query.expenseCategory = category;
+
+                if (startDate && endDate) {
+                    const start = new Date(startDate);
+                    const end = new Date(endDate); end.setHours(23, 59, 59, 999);
+                    query.$expr = {
+                        $and: [
+                            { $gte: [{ $dateFromString: { dateString: "$date", format: "%d.%b.%Y", onError: new Date(0) } }, start] },
+                            { $lte: [{ $dateFromString: { dateString: "$date", format: "%d.%b.%Y", onError: new Date(0) } }, end] },
+                        ],
+                    };
+                }
+
+                const totals = await expenseCollections.aggregate([
+                    { $match: query },
+                    { $group: { _id: null, totalAmount: { $sum: { $ifNull: ["$amount", 0] } }, totalQuantity: { $sum: { $ifNull: ["$quantity", 0] } }, count: { $sum: 1 } } }
+                ]).toArray();
+
+                const totalAmount = totals[0]?.totalAmount || 0;
+                const totalQuantity = totals[0]?.totalQuantity || 0;
+                const totalCount = totals[0]?.count || 0;
+
+                const data = await expenseCollections
+                    .find(query, { projection: { expense: 1, amount: 1 } }) // only what the UI shows
+                    .sort({ _id: -1 })
+                    .skip((page - 1) * limit)
+                    .limit(limit)
+                    .toArray();
+
+                res.send({ data, totalAmount, totalQuantity, totalCount });
+            } catch (err) {
+                console.error("Public Expense List Error:", err);
+                res.status(500).json({ message: "Internal server error" });
+            }
+        });
+
+        // ===== PUBLIC PAYMENT INFO =====
+        app.get("/public/paymentInfo", async (req, res) => {
+            try {
+                const payment = {
+                    bkash: process.env.PAY_BKASH || "০১৩০৩৭৩১৫২৭",
+                    nagad: process.env.PAY_NAGAD || "০১৩০৩৭৩১৫২৭",
+                    bank: process.env.PAY_BANK || "Islami Bank: ২০৫০১৩৩০২০৫৪৪৩৭১৮",
+                    address: process.env.PAY_ADDRESS || "চিথলিয়া কেন্দ্রীয় জামে মসজিদ, শাখাঃ কুষ্টিয়া",
+                };
+                res.send(payment);
+            } catch (err) {
+                console.error("Public Payment Info Error:", err);
+                res.status(500).json({ message: "Internal server error" });
+            }
+        });
+
+        // ____________________________________________________________________________________________________
         app.delete("/hadith/:id", verifyToken, async (req, res) => {
             const userEmailFromToken = req.user?.email;
             const emailQuery = req.query?.email;
