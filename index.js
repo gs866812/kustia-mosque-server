@@ -782,6 +782,31 @@ async function run() {
             }
         });
         // ____________________________________________________________________________________________________
+        app.delete("/deleteExpense/:id", verifyToken, async (req, res) => {
+            const userEmailFromToken = req.user?.email;
+            const emailQuery = req.query?.email;
+            if (!userEmailFromToken || !emailQuery) {
+                return res.status(400).send({ message: "Email is required" });
+            }
+            if (userEmailFromToken !== emailQuery) {
+                return res.status(403).send({ message: "Forbidden Access" });
+            }
+            const id = req.params.id;
+            if (!id) {
+                return res.status(400).send({ message: "ID is required" });
+            }
+            try {
+                const result = await expenseCollections.deleteOne({ _id: new ObjectId(id) });
+                if (result.deletedCount === 0) {
+                    return res.status(404).send({ message: "data not found" });
+                }
+                res.send(result);
+            } catch (error) {
+                console.error("Delete expense Error:", error);
+                res.status(500).send({ message: "Internal server error" });
+            }
+        });
+        // ____________________________________________________________________________________________________
         app.put("/editHadith/:id", verifyToken, async (req, res) => {
             const hadithId = req.params.id;
             const { hadith, email } = req.body;
