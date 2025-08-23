@@ -90,30 +90,47 @@ async function run() {
         // all post api
         app.post("/submitDonation", async (req, res) => {
             try {
-                let donation = req.body;
+                let donation = req.body || {};
+
+                // normalize numbers
                 donation.amount = Number(donation.amount) || 0;
                 donation.quantity = Number(donation.quantity) || 0;
-                // -----------------------------------------------------------------------------------------
-                const isAddress = await addressCollections.findOne({ address: donation.address });
-                if (!isAddress) {
-                    await addressCollections.insertOne({ address: donation.address });
-                }
-                const isCategory = await incomeCategoriesCollections.findOne({ category: donation.incomeCategory });
-                if (!isCategory) {
-                    await incomeCategoriesCollections.insertOne({ category: donation.incomeCategory });
-                }
-                const isUnit = await unitCollections.findOne({ unit: donation.unit || "None" });
-                if (!isUnit) {
-                    await unitCollections.insertOne({ unit: donation.unit });
-                }
-                const isReference = await referenceCollections.findOne({ reference: donation.reference });
-                if (!isReference) {
-                    await referenceCollections.insertOne({ reference: donation.reference });
-                }
-                // -----------------------------------------------------------------------------------------
 
-                if (!donation.donorId) {
-                    // If donorId not provided, auto-generate it
+                // sanitize strings
+                donation.donorName = (donation.donorName || "").trim();
+                donation.address = (donation.address || "").trim();
+                donation.phone = (donation.phone || "").trim();
+                donation.incomeCategory = (donation.incomeCategory || "").trim();
+                donation.unit = (donation.unit || "").trim();
+                donation.reference = (donation.reference || "").trim();
+
+                // 1) Resolve donor
+                let donorDoc = null;
+
+                if (donation.donorId) {
+                    // Provided: must exist
+                    donation.donorId = Number(donation.donorId) || 0;
+                    donorDoc = await donorCollections.findOne({ donorId: donation.donorId });
+
+                    if (!donorDoc) {
+                        return res.status(400).send({
+                            message: `Invalid donorId: ${donation.donorId}. No donor found in donorCollections.`,
+                        });
+                    }
+
+                    // Force donation fields from donorCollections (single source of truth)
+                    donation.donorName = donorDoc.donorName || donation.donorName;
+                    donation.address = donorDoc.donorAddress || donation.address;
+                    donation.phone = donorDoc.donorContact || donation.phone;
+
+                    // Increase donor's total donateAmount
+                    await donorCollections.updateOne(
+                        { donorId: donation.donorId },
+                        { $inc: { donateAmount: donation.amount } }
+                    );
+
+                } else {
+                    // Not provided: auto-create new donorId and donor doc
                     const lastDonor = await donorCollections
                         .find({ donorId: { $exists: true } })
                         .sort({ donorId: -1 })
@@ -121,31 +138,58 @@ async function run() {
                         .toArray();
 
                     const lastId = lastDonor?.[0]?.donorId || 10;
-                    donation.donorId = lastId + 1;
+                    const nextId = lastId + 1;
 
-                    await donorCollections.insertOne({
-                        donorId: donation.donorId,
-                        donorName: donation.donorName,
-                        donorAddress: donation.address,
-                        donorContact: donation.phone,
-                        donateAmount: donation?.amount || 0,
-                    });
-                } else {
-                    // Make sure donorID is a number
-                    donation.donorId = Number(donation.donorId) || 0;
-                    await donorCollections.updateOne(
-                        { donorId: donation.donorId },
-                        { $inc: { donateAmount: donation?.amount || 0 } },
-                    )
+                    donorDoc = {
+                        donorId: nextId,
+                        donorName: donation.donorName,   // take from form
+                        donorAddress: donation.address,  // take from form
+                        donorContact: donation.phone,    // take from form
+                        donateAmount: donation.amount || 0,
+                        createdAt: new Date(),
+                    };
+
+                    // Insert donor
+                    await donorCollections.insertOne(donorDoc);
+
+                    // Force donation to match donor
+                    donation.donorId = donorDoc.donorId;
+                    donation.donorName = donorDoc.donorName;
+                    donation.address = donorDoc.donorAddress;
+                    donation.phone = donorDoc.donorContact;
                 }
 
+                // 2) Upsert auxiliary lists **after** we know final address/category/unit/reference
+                if (donation.address) {
+                    const isAddress = await addressCollections.findOne({ address: donation.address });
+                    if (!isAddress) await addressCollections.insertOne({ address: donation.address });
+                }
+
+                if (donation.incomeCategory) {
+                    const isCategory = await incomeCategoriesCollections.findOne({ category: donation.incomeCategory });
+                    if (!isCategory) await incomeCategoriesCollections.insertOne({ category: donation.incomeCategory });
+                }
+
+                if (donation.unit) {
+                    const isUnit = await unitCollections.findOne({ unit: donation.unit });
+                    if (!isUnit) await unitCollections.insertOne({ unit: donation.unit });
+                }
+
+                if (donation.reference) {
+                    const isReference = await referenceCollections.findOne({ reference: donation.reference });
+                    if (!isReference) await referenceCollections.insertOne({ reference: donation.reference });
+                }
+
+                // 3) Insert donation (now guaranteed in sync with donor)
                 const result = await donationCollections.insertOne(donation);
-                res.send(result);
+                return res.send(result);
+
             } catch (error) {
                 console.error("Submit Donation Error:", error);
-                res.status(500).send({ message: "Internal server error" });
+                return res.status(500).send({ message: "Internal server error" });
             }
         });
+
         // ___________________________________________________________________________________________________
         app.post("/submitExpense", async (req, res) => {
             try {
@@ -185,6 +229,50 @@ async function run() {
 
             } catch (error) {
                 res.json({ message: "Internal server error" });
+            }
+        });
+        // ___________________________________________________________________________________________________
+        // ===== ADD DONOR =====
+        app.post("/addDonor", verifyToken, async (req, res) => {
+            const userEmailFromToken = req.user?.email;
+            const emailQuery = req.query?.email;
+
+            if (!userEmailFromToken || !emailQuery) {
+                return res.status(400).send({ message: "Email is required" });
+            }
+            if (userEmailFromToken !== emailQuery) {
+                return res.status(403).send({ message: "Forbidden Access" });
+            }
+
+            try {
+                const { donorName, donorAddress = "", donorContact = "" } = req.body || {};
+                if (!donorName || !donorName.trim()) {
+                    return res.status(400).send({ message: "Donor name is required" });
+                }
+
+                // auto-generate next donorId
+                const last = await donorCollections
+                    .find({ donorId: { $exists: true } })
+                    .sort({ donorId: -1 })
+                    .limit(1)
+                    .toArray();
+                const lastId = last?.[0]?.donorId || 10;
+                const nextId = lastId + 1;
+
+                const doc = {
+                    donorId: nextId,
+                    donorName: String(donorName).trim(),
+                    donorAddress: String(donorAddress).trim(),
+                    donorContact: String(donorContact).trim(),
+                    donateAmount: 0,
+                    createdAt: new Date()
+                };
+
+                const result = await donorCollections.insertOne(doc);
+                res.send({ insertedId: result.insertedId });
+            } catch (err) {
+                console.error("Add Donor Error:", err);
+                res.status(500).json({ message: "Internal server error" });
             }
         });
         // ___________________________________________________________________________________________________
@@ -240,13 +328,26 @@ async function run() {
                 const reference = await referenceCollections.find().toArray();
 
                 const expenseCategory = await expenseCategoriesCollections.find().toArray();
-                const expenseUnit = await expenseUnitCollections.find().toArray();
+
+
+                // const expenseUnit = await expenseUnitCollections.find().toArray();
+                const expenseUnit = await expenseCollections.distinct("unit", {
+                    unit: { $exists: true, $ne: "" },
+                });
+
+
+                // Optional: sort nicely (Bangla-friendly)
+                const sortedUnit = expenseUnit
+                    .filter(Boolean)
+                    .sort((a, b) => String(a).localeCompare(String(b), "bn"));
+
                 const expenseReference = await expenseReferenceCollections.find().toArray();
 
                 res.send({
                     address: address.map(a => a.address),
                     incomeCategories: incomeCategories.map(c => c.category),
-                    unit: unit.map(u => u.unit),
+                    // unit: unit.map(u => u.unit),
+                    sortedUnit,
                     reference: reference.map(r => r.reference),
                     expenseCategory: expenseCategory.map(c => c.category),
                     expenseUnit: expenseUnit.map(u => u.unit),
@@ -333,13 +434,26 @@ async function run() {
                 const categories = await donationCollections.distinct("incomeCategory", {
                     incomeCategory: { $exists: true, $ne: "" },
                 });
+                const unit = await donationCollections.distinct("unit", {
+                    unit: { $exists: true, $ne: "" },
+                });
+                const paymentOptions = await donationCollections.distinct("paymentOption", {
+                    paymentOption: { $exists: true, $ne: "" },
+                });
+
 
                 // Optional: sort nicely (Bangla-friendly)
                 const sorted = categories
                     .filter(Boolean)
                     .sort((a, b) => String(a).localeCompare(String(b), "bn"));
+                const sortedUnit = unit
+                    .filter(Boolean)
+                    .sort((a, b) => String(a).localeCompare(String(b), "bn"));
+                const sortedPayment = paymentOptions
+                    .filter(Boolean)
+                    .sort((a, b) => String(a).localeCompare(String(b), "bn"));
 
-                res.send(sorted);
+                res.send({ sorted, sortedUnit, sortedPayment });
             } catch (error) {
                 console.error("Get Donation Categories Error:", error);
                 res.status(500).json({ message: "Internal server error" });
@@ -732,6 +846,59 @@ async function run() {
         });
 
         // ____________________________________________________________________________________________________
+        app.get("/donorList", verifyToken, async (req, res) => {
+            const userEmailFromToken = req.user?.email;
+            const emailQuery = req.query?.email;
+
+            if (!userEmailFromToken || !emailQuery) {
+                return res.status(400).send({ message: "Email is required" });
+            }
+            if (userEmailFromToken !== emailQuery) {
+                return res.status(403).send({ message: "Forbidden Access" });
+            }
+
+            try {
+                let { search = "", page = 1, limit = 10 } = req.query;
+                page = parseInt(page); limit = parseInt(limit);
+
+                const query = {};
+                if (search) {
+                    const num = Number(search);
+                    const isNum = !isNaN(num);
+                    const or = [
+                        { donorName: { $regex: search, $options: "i" } },
+                        { donorAddress: { $regex: search, $options: "i" } },
+                        { donorContact: { $regex: search, $options: "i" } },
+                    ];
+                    if (isNum) {
+                        or.push({ donorId: num });
+                        or.push({ donateAmount: num });
+                    }
+                    query.$or = or;
+                }
+
+                const totals = await donorCollections.aggregate([
+                    { $match: query },
+                    { $group: { _id: null, totalCount: { $sum: 1 }, totalDonateAmount: { $sum: { $ifNull: ["$donateAmount", 0] } } } }
+                ]).toArray();
+
+                const totalCount = totals[0]?.totalCount || 0;
+                const totalDonateAmount = totals[0]?.totalDonateAmount || 0;
+
+                const data = await donorCollections
+                    .find(query)
+                    .sort({ _id: -1 }) // or { _id: -1 }
+                    .skip((page - 1) * limit)
+                    .limit(limit)
+                    .toArray();
+
+                res.send({ data, totalCount, totalDonateAmount });
+            } catch (err) {
+                console.error("Get Donor List Error:", err);
+                res.status(500).json({ message: "Internal server error" });
+            }
+        });
+        // ____________________________________________________________________________________________________
         app.delete("/hadith/:id", verifyToken, async (req, res) => {
             const userEmailFromToken = req.user?.email;
             const emailQuery = req.query?.email;
@@ -806,6 +973,41 @@ async function run() {
                 res.status(500).send({ message: "Internal server error" });
             }
         });
+        // ____________________________________________________________________________________________________// ===== DELETE DONOR (blocked if donations exist) =====
+        app.delete("/deleteDonor/:id", verifyToken, async (req, res) => {
+            const userEmailFromToken = req.user?.email;
+            const emailQuery = req.query?.email;
+
+            if (!userEmailFromToken || !emailQuery) {
+                return res.status(400).send({ message: "Email is required" });
+            }
+            if (userEmailFromToken !== emailQuery) {
+                return res.status(403).send({ message: "Forbidden Access" });
+            }
+
+            try {
+                const id = req.params.id;
+                if (!id) return res.status(400).send({ message: "ID is required" });
+
+                const donor = await donorCollections.findOne({ _id: new ObjectId(id) });
+                if (!donor) return res.status(404).send({ message: "Donor not found" });
+
+                // prevent deleting if there are donations linked to this donorId
+                // const hasDonations = await donationCollections.countDocuments({ donorId: donor.donorId });
+                // if (hasDonations > 0) {
+                //     return res.status(409).send({ message: "This donor has donations; delete blocked." });
+                // }
+
+                const result = await donorCollections.deleteOne({ _id: new ObjectId(id) });
+                if (result.deletedCount === 0) {
+                    return res.status(404).send({ message: "Donor not found" });
+                }
+                res.send(result);
+            } catch (err) {
+                console.error("Delete Donor Error:", err);
+                res.status(500).json({ message: "Internal server error" });
+            }
+        });
         // ____________________________________________________________________________________________________
         app.put("/editHadith/:id", verifyToken, async (req, res) => {
             const hadithId = req.params.id;
@@ -857,6 +1059,8 @@ async function run() {
                     amount,
                     quantity,
                     incomeCategory,
+                    unit,
+                    paymentOption,
                     reference
                 } = req.body || {};
 
@@ -894,6 +1098,8 @@ async function run() {
                 }
 
                 if (incomeCategory !== undefined) $set.incomeCategory = String(incomeCategory);
+                if (unit !== undefined) $set.unit = String(unit);
+                if (paymentOption !== undefined) $set.paymentOption = String(paymentOption);
                 if (reference !== undefined) $set.reference = String(reference);
 
                 if (Object.keys($set).length === 0) {
@@ -934,6 +1140,7 @@ async function run() {
                     expense,           // string
                     amount,            // number
                     quantity,          // number
+                    unit,            // string
                     expenseCategory,   // string
                     reference,         // string
                     note               // string
@@ -966,6 +1173,7 @@ async function run() {
                 }
 
                 if (expenseCategory !== undefined) $set.expenseCategory = String(expenseCategory);
+                if (unit !== undefined) $set.unit = String(unit);
                 if (reference !== undefined) $set.reference = String(reference);
                 if (note !== undefined) $set.note = String(note);
 
@@ -987,6 +1195,224 @@ async function run() {
             }
         });
         // ____________________________________________________________________________________________________
+        // ===== UPDATE DONOR (no donorId change here) =====
+        app.put("/updateDonor/:id", verifyToken, async (req, res) => {
+            const userEmailFromToken = req.user?.email;
+            const emailQuery = req.query?.email;
+
+            if (!userEmailFromToken || !emailQuery) {
+                return res.status(400).send({ message: "Email is required" });
+            }
+            if (userEmailFromToken !== emailQuery) {
+                return res.status(403).send({ message: "Forbidden Access" });
+            }
+
+            try {
+                const { id } = req.params;
+                const { donorName, donorAddress, donorContact } = req.body || {};
+                const $set = {};
+
+                if (donorName !== undefined) $set.donorName = String(donorName).trim();
+                if (donorAddress !== undefined) $set.donorAddress = String(donorAddress).trim();
+                if (donorContact !== undefined) $set.donorContact = String(donorContact).trim();
+
+                if (Object.keys($set).length === 0) {
+                    return res.status(400).send({ message: "No valid fields to update" });
+                }
+
+                $set.updatedAt = new Date();
+
+                const result = await donorCollections.updateOne(
+                    { _id: new ObjectId(id) },
+                    { $set }
+                );
+
+                res.send({ modifiedCount: result.modifiedCount });
+            } catch (err) {
+                console.error("Update Donor Error:", err);
+                res.status(500).json({ message: "Internal server error" });
+            }
+        });
+        // ____________________________________________________________________________________________________
+
+        // **************************************************************************************************
+        // ===== META MANAGER (income/expense categories, units, references) =====
+
+        // Map UI 'kind' to collection + key + where it's used (for safe rename/delete)
+        const metaKindMap = {
+            incomeCategories: {
+                coll: incomeCategoriesCollections,
+                key: "category",
+                usage: { coll: donationCollections, field: "incomeCategory" },
+            },
+            expenseCategories: {
+                coll: expenseCategoriesCollections,
+                key: "category",
+                usage: { coll: expenseCollections, field: "expenseCategory" },
+            },
+            units: {
+                coll: unitCollections,
+                key: "unit",
+                usage: { coll: donationCollections, field: "unit" },
+            },
+            expenseUnits: {
+                coll: expenseUnitCollections,
+                key: "unit",
+                usage: { coll: expenseCollections, field: "unit" },
+            },
+            references: {
+                coll: referenceCollections,
+                key: "reference",
+                usage: { coll: donationCollections, field: "reference" },
+            },
+            expenseReferences: {
+                coll: expenseReferenceCollections,
+                key: "reference",
+                usage: { coll: expenseCollections, field: "reference" },
+            },
+        };
+
+        function getMetaConfig(kind) {
+            const cfg = metaKindMap[kind];
+            if (!cfg) throw new Error("Invalid kind");
+            return cfg;
+        }
+
+        // GET /meta?kind=&search=&page=&limit=&email=
+        app.get("/meta", verifyToken, async (req, res) => {
+            const userEmailFromToken = req.user?.email;
+            const emailQuery = req.query?.email;
+            if (!userEmailFromToken || !emailQuery) return res.status(400).send({ message: "Email is required" });
+            if (userEmailFromToken !== emailQuery) return res.status(403).send({ message: "Forbidden Access" });
+
+            try {
+                let { kind = "", search = "", page = 1, limit = 10 } = req.query;
+                page = parseInt(page); limit = parseInt(limit);
+                const { coll, key } = getMetaConfig(kind);
+
+                const query = {};
+                if (search) query[key] = { $regex: search, $options: "i" };
+
+                const totalCount = await coll.countDocuments(query);
+                const docs = await coll
+                    .find(query)
+                    .sort({ [key]: 1 })
+                    .skip((page - 1) * limit)
+                    .limit(limit)
+                    .toArray();
+
+                const data = docs.map(d => ({ _id: d._id, value: d[key] }));
+                res.send({ data, totalCount });
+            } catch (err) {
+                console.error("Meta GET error:", err);
+                res.status(500).json({ message: "Internal server error" });
+            }
+        });
+
+        // POST /meta  body: { kind, value }
+        app.post("/meta", verifyToken, async (req, res) => {
+            const userEmailFromToken = req.user?.email;
+            const emailQuery = req.query?.email;
+            if (!userEmailFromToken || !emailQuery) return res.status(400).send({ message: "Email is required" });
+            if (userEmailFromToken !== emailQuery) return res.status(403).send({ message: "Forbidden Access" });
+
+            try {
+                const { kind, value } = req.body || {};
+                if (!kind || !value || !String(value).trim()) {
+                    return res.status(400).send({ message: "kind and value are required" });
+                }
+
+                const { coll, key } = getMetaConfig(kind);
+                const val = String(value).trim();
+
+                const exists = await coll.findOne({ [key]: val });
+                if (exists) return res.status(409).send({ message: "Already exists" });
+
+                const result = await coll.insertOne({ [key]: val, createdAt: new Date() });
+                res.send({ insertedId: result.insertedId });
+            } catch (err) {
+                console.error("Meta POST error:", err);
+                res.status(500).json({ message: "Internal server error" });
+            }
+        });
+
+        // PUT /meta/:id  body: { kind, value }  (propagate rename to usage docs)
+        app.put("/meta/:id", verifyToken, async (req, res) => {
+            const userEmailFromToken = req.user?.email;
+            const emailQuery = req.query?.email;
+            if (!userEmailFromToken || !emailQuery) return res.status(400).send({ message: "Email is required" });
+            if (userEmailFromToken !== emailQuery) return res.status(403).send({ message: "Forbidden Access" });
+
+            try {
+                const { id } = req.params;
+                const { kind, value } = req.body || {};
+                if (!kind || !value || !String(value).trim()) {
+                    return res.status(400).send({ message: "kind and value are required" });
+                }
+
+                const { coll, key, usage } = getMetaConfig(kind);
+                const newVal = String(value).trim();
+
+                const oldDoc = await coll.findOne({ _id: new ObjectId(id) });
+                if (!oldDoc) return res.status(404).send({ message: "Not found" });
+                const oldVal = oldDoc[key];
+
+                if (oldVal === newVal) return res.send({ updated: false });
+
+                const dup = await coll.findOne({ [key]: newVal });
+                if (dup) return res.status(409).send({ message: "Value already exists" });
+
+                const up = await coll.updateOne(
+                    { _id: new ObjectId(id) },
+                    { $set: { [key]: newVal, updatedAt: new Date() } }
+                );
+
+                if (usage?.coll && usage?.field) {
+                    await usage.coll.updateMany(
+                        { [usage.field]: oldVal },
+                        { $set: { [usage.field]: newVal } }
+                    );
+                }
+
+                res.send({ modifiedCount: up.modifiedCount, updated: true });
+            } catch (err) {
+                console.error("Meta PUT error:", err);
+                res.status(500).json({ message: "Internal server error" });
+            }
+        });
+
+        // DELETE /meta/:id?kind=&email=  (blocked if value is in use)
+        app.delete("/meta/:id", verifyToken, async (req, res) => {
+            const userEmailFromToken = req.user?.email;
+            const emailQuery = req.query?.email;
+            if (!userEmailFromToken || !emailQuery) return res.status(400).send({ message: "Email is required" });
+            if (userEmailFromToken !== emailQuery) return res.status(403).send({ message: "Forbidden Access" });
+
+            try {
+                const { id } = req.params;
+                const { kind } = req.query || {};
+                if (!kind) return res.status(400).send({ message: "kind is required" });
+
+                const { coll, key, usage } = getMetaConfig(kind);
+                const doc = await coll.findOne({ _id: new ObjectId(id) });
+                if (!doc) return res.status(404).send({ message: "Not found" });
+
+                // const val = doc[key];
+
+                // if (usage?.coll && usage?.field) {
+                //     const inUse = await usage.coll.countDocuments({ [usage.field]: val });
+                //     if (inUse > 0) return res.status(409).send({ message: "Value is in use; delete blocked." });
+                // }
+
+                const del = await coll.deleteOne({ _id: new ObjectId(id) });
+                if (del.deletedCount === 0) return res.status(404).send({ message: "Not found" });
+
+                res.send({ deletedCount: del.deletedCount });
+            } catch (err) {
+                console.error("Meta DELETE error:", err);
+                res.status(500).json({ message: "Internal server error" });
+            }
+        });
 
         // **************************************************************************************************
         // **************************************************************************************************
