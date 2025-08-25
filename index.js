@@ -281,34 +281,38 @@ async function run() {
         // All get api
         // ___________________________________________________________________________________________________
         app.get("/getDonorId/:id", verifyToken, async (req, res) => {
-            const userEmailFromToken = req.user.email;
-            const emailQuery = req.query.email;
+            const userEmailFromToken = req.user?.email;
+            const emailQuery = req.query?.email;
 
+            if (!userEmailFromToken || !emailQuery) {
+                return res.status(400).send({ message: "Email is required" });
+            }
             if (userEmailFromToken !== emailQuery) {
                 return res.status(403).send({ message: "Forbidden Access" });
             }
 
-            const donorId = parseInt(req.params.id);
-
-            if (isNaN(donorId)) {
-                return res.json({ message: "Invalid ID" });
-            }
-
             try {
-                const donor = await donorCollections.findOne({ donorId });
-                if (!donor) return res.json({ message: "Donor not found" });
-                const address = await addressCollections.find().toArray();
+                const rawId = req.params.id;
+                const asNum = Number(rawId);
+                const filter = Number.isFinite(asNum)
+                    ? { $or: [{ donorId: asNum }, { donorId: String(asNum) }] }
+                    : { donorId: rawId };
 
-                res.send({
-                    donorName: donor.donorName,
-                    address: address,
-                    phone: donor.donorContact,
+                const donor = await donorCollections.findOne(filter);
+                if (!donor) return res.status(404).json({ message: "Donor not found" });
+
+                // map correct fields
+                return res.send({
+                    donorName: donor.donorName || "",
+                    address: donor.donorAddress || "",   // <-- key fix
+                    phone: donor.donorContact || "",
                 });
             } catch (error) {
-                // console.error("Get Donor Error:", error);
-                res.json({ message: "Server error" });
+                console.error("Get Donor Error:", error);
+                return res.status(500).json({ message: "Server error" });
             }
         });
+
         // ____________________________________________________________________________________________________
         app.get("/getInfo", verifyToken, async (req, res) => {
             const userEmailFromToken = req.user?.email;
@@ -331,24 +335,23 @@ async function run() {
                 const expenseCategory = await expenseCategoriesCollections.find().toArray();
 
 
-                // const expenseUnit = await expenseUnitCollections.find().toArray();
-                const expenseUnit = await expenseCollections.distinct("unit", {
-                    unit: { $exists: true, $ne: "" },
-                });
+                const expenseUnit = await expenseUnitCollections.find().toArray();
+                // const expenseUnit = await expenseCollections.distinct("unit", {
+                //     unit: { $exists: true, $ne: "" },
+                // });
 
 
                 // Optional: sort nicely (Bangla-friendly)
-                const sortedUnit = expenseUnit
-                    .filter(Boolean)
-                    .sort((a, b) => String(a).localeCompare(String(b), "bn"));
+                // const sortedUnit = expenseUnit
+                //     .filter(Boolean)
+                //     .sort((a, b) => String(a).localeCompare(String(b), "bn"));
 
                 const expenseReference = await expenseReferenceCollections.find().toArray();
 
                 res.send({
                     address: address.map(a => a.address),
                     incomeCategories: incomeCategories.map(c => c.category),
-                    // unit: unit.map(u => u.unit),
-                    sortedUnit,
+                    unit: unit.map(u => u.unit),
                     reference: reference.map(r => r.reference),
                     expenseCategory: expenseCategory.map(c => c.category),
                     expenseUnit: expenseUnit.map(u => u.unit),
@@ -900,6 +903,65 @@ async function run() {
             }
         });
         // ____________________________________________________________________________________________________
+        app.get("/donorList/export", verifyToken, async (req, res) => {
+            const userEmailFromToken = req.user?.email;
+            const emailQuery = req.query?.email;
+
+            if (!userEmailFromToken || !emailQuery) {
+                return res.status(400).send({ message: "Email is required" });
+            }
+            if (userEmailFromToken !== emailQuery) {
+                return res.status(403).send({ message: "Forbidden Access" });
+            }
+
+            try {
+                let { search = "" } = req.query;
+
+                const query = {};
+                if (search) {
+                    const num = Number(search);
+                    const isNum = !isNaN(num);
+                    const or = [
+                        { donorName: { $regex: search, $options: "i" } },
+                        { donorAddress: { $regex: search, $options: "i" } },
+                        { donorContact: { $regex: search, $options: "i" } },
+                    ];
+                    if (isNum) {
+                        or.push({ donorId: num });
+                        or.push({ donateAmount: num });
+                    }
+                    query.$or = or;
+                }
+
+                // totals for the full filtered set
+                const totals = await donorCollections.aggregate([
+                    { $match: query },
+                    {
+                        $group: {
+                            _id: null,
+                            totalCount: { $sum: 1 },
+                            totalDonateAmount: { $sum: { $ifNull: ["$donateAmount", 0] } },
+                        },
+                    },
+                ]).toArray();
+
+                const totalCount = totals[0]?.totalCount || 0;
+                const totalDonateAmount = totals[0]?.totalDonateAmount || 0;
+
+                // full data (no pagination)
+                const data = await donorCollections
+                    .find(query)
+                    .sort({ _id: -1 })
+                    .toArray();
+
+                res.send({ data, totalCount, totalDonateAmount });
+            } catch (err) {
+                console.error("Export Donor List Error:", err);
+                res.status(500).json({ message: "Internal server error" });
+            }
+        });
+
+        // ____________________________________________________________________________________________________
         app.delete("/hadith/:id", verifyToken, async (req, res) => {
             const userEmailFromToken = req.user?.email;
             const emailQuery = req.query?.email;
@@ -1058,8 +1120,8 @@ async function run() {
                 const {
                     date,           // "DD.MMM.YYYY"
                     donorName,
-                    address,
-                    phone,
+                    address,        // maps to donorAddress
+                    phone,          // maps to donorContact
                     amount,
                     quantity,
                     incomeCategory,
@@ -1067,6 +1129,12 @@ async function run() {
                     paymentOption,
                     reference
                 } = req.body || {};
+
+                // --- 1) Load existing donation to compute delta & locate donor ---
+                const oldDonation = await donationCollections.findOne({ _id: new ObjectId(id) });
+                if (!oldDonation) {
+                    return res.status(404).send({ message: "Donation not found" });
+                }
 
                 const $set = {};
 
@@ -1079,17 +1147,19 @@ async function run() {
                         });
                     }
                     $set.date = m.format("DD.MMM.YYYY");
-                    $set.month = m.format("MMMM"); // e.g., "August"
-                    $set.year = m.format("YYYY");  // e.g., "2025"
+                    $set.month = m.format("MMMM");
+                    $set.year = m.format("YYYY");
                 }
 
                 // amount
+                let newAmountForDelta = Number(oldDonation.amount || 0);
                 if (amount !== undefined) {
                     const num = Number(amount);
                     if (!Number.isFinite(num) || num < 0) {
                         return res.status(400).send({ message: "Invalid amount" });
                     }
                     $set.amount = num;
+                    newAmountForDelta = num;
                 }
 
                 // quantity
@@ -1115,22 +1185,68 @@ async function run() {
 
                 $set.updatedAt = new Date();
 
-                const result = await donationCollections.updateOne(
+                // --- 2) Update the donation itself ---
+                const donationUpdateResult = await donationCollections.updateOne(
                     { _id: new ObjectId(id) },
                     { $set }
                 );
 
-                const existDonor = await donorCollections.findOne({donorId: new ObjectId(id).donorId});
-                if(existDonor){
-                    // here we need to donor name, address and mobile, also we need to increase/decrease donateAmount base on edited amount.
+                // --- 3) Update donor profile & donateAmount delta ---
+                const prevAmount = Number(oldDonation.amount || 0);
+                const delta = newAmountForDelta - prevAmount; // +ve => increase, -ve => decrease
+
+                // Build a robust donor filter from donation
+                let donorFilter = null;
+
+                // Prefer an explicit reference if you have it on the donation:
+                // e.g., oldDonation.donorObjectId or oldDonation.donorMongoId
+                if (oldDonation.donorObjectId && ObjectId.isValid(oldDonation.donorObjectId)) {
+                    donorFilter = { _id: new ObjectId(oldDonation.donorObjectId) };
+                } else if (oldDonation.donorId !== undefined && oldDonation.donorId !== null) {
+                    // donorId could be numeric (597) or a numeric string ("597")
+                    const raw = oldDonation.donorId;
+                    const asNumber = Number(raw);
+                    if (Number.isFinite(asNumber)) {
+                        donorFilter = { $or: [{ donorId: asNumber }, { donorId: String(asNumber) }] };
+                    } else {
+                        donorFilter = { donorId: raw };
+                    }
+                } else if (oldDonation.phone || phone) {
+                    // Fallback by phone -> donorContact
+                    const phoneVal = String(phone ?? oldDonation.phone).trim();
+                    if (phoneVal) donorFilter = { donorContact: phoneVal };
                 }
 
-                return res.send({ modifiedCount: result.modifiedCount });
+                if (donorFilter) {
+                    const donorDoc = await donorCollections.findOne(donorFilter);
+
+                    if (donorDoc) {
+                        const donorSet = {};
+                        if (donorName !== undefined) donorSet.donorName = String(donorName);
+                        if (address !== undefined) donorSet.donorAddress = String(address);
+                        if (phone !== undefined) donorSet.donorContact = String(phone);
+
+                        if (delta !== 0) {
+                            const currentTotal = Number(donorDoc.donateAmount || 0);
+                            const nextTotal = Math.max(0, currentTotal + delta);
+                            donorSet.donateAmount = nextTotal;
+                        }
+
+                        if (Object.keys(donorSet).length > 0) {
+                            donorSet.updatedAt = new Date();
+                            await donorCollections.updateOne({ _id: donorDoc._id }, { $set: donorSet });
+                        }
+                    }
+                    // If no donor found, we silently skip; you can log if you want.
+                }
+
+                return res.send({ modifiedCount: donationUpdateResult.modifiedCount });
             } catch (err) {
                 console.error("Update Donation Error:", err);
                 return res.status(500).json({ message: "Internal server error" });
             }
         });
+
 
         // ____________________________________________________________________________________________________
         // PUT: update an expense
@@ -1219,8 +1335,12 @@ async function run() {
                 return res.status(403).send({ message: "Forbidden Access" });
             }
 
+            const { id } = req.params;
+            if (!ObjectId.isValid(id)) {
+                return res.status(400).send({ message: "Invalid donor id" });
+            }
+
             try {
-                const { id } = req.params;
                 const { donorName, donorAddress, donorContact } = req.body || {};
                 const $set = {};
 
@@ -1232,19 +1352,70 @@ async function run() {
                     return res.status(400).send({ message: "No valid fields to update" });
                 }
 
+                // Ensure donor exists and get donorId for propagation
+                const donorDoc = await donorCollections.findOne(
+                    { _id: new ObjectId(id) },
+                    { projection: { donorId: 1 } }
+                );
+                if (!donorDoc) {
+                    return res.status(404).send({ message: "Donor not found" });
+                }
+
                 $set.updatedAt = new Date();
 
-                const result = await donorCollections.updateOne(
+                // 1) Update donor profile
+                const donorUpdate = await donorCollections.updateOne(
                     { _id: new ObjectId(id) },
                     { $set }
                 );
 
-                res.send({ modifiedCount: result.modifiedCount });
+                // 2) Propagate changes to donations that share this donorId
+                // Build a filter that matches both numeric and string forms
+                const rawDonorId = donorDoc.donorId;
+                const or = [];
+                if (rawDonorId !== undefined && rawDonorId !== null) {
+                    const asNum = Number(rawDonorId);
+                    if (Number.isFinite(asNum)) {
+                        or.push({ donorId: asNum }, { donorId: String(asNum) });
+                    } else {
+                        or.push({ donorId: rawDonorId });
+                    }
+                }
+
+                // If you also store a direct link in donations (optional), you can include these:
+                // or.push({ donorObjectId: id }, { donorMongoId: id });
+
+                let donationMatched = 0;
+                let donationModified = 0;
+
+                if (or.length > 0) {
+                    const donationSet = {};
+                    if (donorName !== undefined) donationSet.donorName = String(donorName).trim();
+                    if (donorAddress !== undefined) donationSet.address = String(donorAddress).trim();
+                    if (donorContact !== undefined) donationSet.phone = String(donorContact).trim();
+
+                    if (Object.keys(donationSet).length > 0) {
+                        donationSet.updatedAt = new Date();
+                        const donationsUpdate = await donationCollections.updateMany(
+                            { $or: or },
+                            { $set: donationSet }
+                        );
+                        donationMatched = donationsUpdate.matchedCount || 0;
+                        donationModified = donationsUpdate.modifiedCount || 0;
+                    }
+                }
+
+                return res.send({
+                    modifiedCount: donorUpdate.modifiedCount,   // donor profile updated
+                    donationMatched,
+                    donationModified
+                });
             } catch (err) {
                 console.error("Update Donor Error:", err);
-                res.status(500).json({ message: "Internal server error" });
+                return res.status(500).json({ message: "Internal server error" });
             }
         });
+
         // ____________________________________________________________________________________________________
 
         // **************************************************************************************************
