@@ -714,6 +714,98 @@ async function run() {
             }
         });
         // ____________________________________________________________________________________________________
+        // ===== FULL filtered expense list for export (no pagination) =====
+        app.get("/expenseList/export", verifyToken, async (req, res) => {
+            const userEmailFromToken = req.user?.email;
+            const emailQuery = req.query?.email;
+
+            if (!userEmailFromToken || !emailQuery) {
+                return res.status(400).send({ message: "Email is required" });
+            }
+            if (userEmailFromToken !== emailQuery) {
+                return res.status(403).send({ message: "Forbidden Access" });
+            }
+
+            try {
+                let { search = "", category = "", startDate = "", endDate = "" } = req.query;
+
+                const query = {};
+
+                if (search) {
+                    const num = Number(search);
+                    const isNum = !isNaN(num);
+
+                    const or = [
+                        { expense: { $regex: search, $options: "i" } },
+                        { expenseCategory: { $regex: search, $options: "i" } },
+                        { reference: { $regex: search, $options: "i" } },
+                        { note: { $regex: search, $options: "i" } },
+                        { unit: { $regex: search, $options: "i" } },
+                        { date: { $regex: search, $options: "i" } },
+                        { month: { $regex: search, $options: "i" } },
+                        { year: { $regex: search, $options: "i" } },
+                    ];
+                    if (isNum) {
+                        or.push({ amount: num });
+                        or.push({ quantity: num });
+                    }
+                    query.$or = or;
+                }
+
+                if (category) query.expenseCategory = category;
+
+                if (startDate && endDate) {
+                    const start = new Date(startDate);
+                    const end = new Date(endDate);
+                    end.setHours(23, 59, 59, 999);
+
+                    query.$expr = {
+                        $and: [
+                            {
+                                $gte: [
+                                    { $dateFromString: { dateString: "$date", format: "%d.%b.%Y", onError: new Date(0) } },
+                                    start
+                                ]
+                            },
+                            {
+                                $lte: [
+                                    { $dateFromString: { dateString: "$date", format: "%d.%b.%Y", onError: new Date(0) } },
+                                    end
+                                ]
+                            }
+                        ]
+                    };
+                }
+
+                const totals = await expenseCollections.aggregate([
+                    { $match: query },
+                    {
+                        $group: {
+                            _id: null,
+                            totalAmount: { $sum: { $ifNull: ["$amount", 0] } },
+                            totalQuantity: { $sum: { $ifNull: ["$quantity", 0] } },
+                            count: { $sum: 1 }
+                        }
+                    }
+                ]).toArray();
+
+                const totalAmount = totals[0]?.totalAmount || 0;
+                const totalQuantity = totals[0]?.totalQuantity || 0;
+                const totalCount = totals[0]?.count || 0;
+
+                const data = await expenseCollections
+                    .find(query)
+                    .sort({ _id: -1 })
+                    .toArray();
+
+                res.send({ data, totalAmount, totalQuantity, totalCount });
+            } catch (err) {
+                console.error("Expense export error:", err);
+                res.status(500).json({ message: "Internal server error" });
+            }
+        });
+
+        // ____________________________________________________________________________________________________
         // ===== PUBLIC DONATIONS (list + totals) =====
         app.get("/public/donationList", async (req, res) => {
             try {
@@ -903,7 +995,8 @@ async function run() {
             }
         });
         // ____________________________________________________________________________________________________
-        app.get("/donorList/export", verifyToken, async (req, res) => {
+
+        app.get("/donationList/export", verifyToken, async (req, res) => {
             const userEmailFromToken = req.user?.email;
             const emailQuery = req.query?.email;
 
@@ -915,48 +1008,84 @@ async function run() {
             }
 
             try {
-                let { search = "" } = req.query;
+                let { search = "", category = "", startDate = "", endDate = "" } = req.query;
 
                 const query = {};
+
+                // --- SEARCH ---
                 if (search) {
                     const num = Number(search);
                     const isNum = !isNaN(num);
                     const or = [
                         { donorName: { $regex: search, $options: "i" } },
-                        { donorAddress: { $regex: search, $options: "i" } },
-                        { donorContact: { $regex: search, $options: "i" } },
+                        { address: { $regex: search, $options: "i" } },
+                        { incomeCategory: { $regex: search, $options: "i" } },
+                        { reference: { $regex: search, $options: "i" } },
+                        { phone: { $regex: search, $options: "i" } },
+                        { paymentOption: { $regex: search, $options: "i" } },
+                        { unit: { $regex: search, $options: "i" } },
+                        { month: { $regex: search, $options: "i" } },
+                        { year: { $regex: search, $options: "i" } },
+                        { date: { $regex: search, $options: "i" } }, // "DD.MMM.YYYY"
                     ];
                     if (isNum) {
-                        or.push({ donorId: num });
-                        or.push({ donateAmount: num });
+                        or.push({ donorId: num }, { amount: num }, { quantity: num });
                     }
                     query.$or = or;
                 }
 
-                // totals for the full filtered set
-                const totals = await donorCollections.aggregate([
+                // --- CATEGORY ---
+                if (category) query.incomeCategory = category;
+
+                // --- DATE RANGE ---
+                if (startDate && endDate) {
+                    const start = new Date(startDate);
+                    const end = new Date(endDate);
+                    end.setHours(23, 59, 59, 999);
+                    query.$expr = {
+                        $and: [
+                            {
+                                $gte: [
+                                    { $dateFromString: { dateString: "$date", format: "%d.%b.%Y", onError: new Date(0) } },
+                                    start
+                                ]
+                            },
+                            {
+                                $lte: [
+                                    { $dateFromString: { dateString: "$date", format: "%d.%b.%Y", onError: new Date(0) } },
+                                    end
+                                ]
+                            }
+                        ]
+                    };
+                }
+
+                // totals over full filtered set
+                const totals = await donationCollections.aggregate([
                     { $match: query },
                     {
                         $group: {
                             _id: null,
-                            totalCount: { $sum: 1 },
-                            totalDonateAmount: { $sum: { $ifNull: ["$donateAmount", 0] } },
-                        },
-                    },
+                            totalAmount: { $sum: { $ifNull: ["$amount", 0] } },
+                            totalQuantity: { $sum: { $ifNull: ["$quantity", 0] } },
+                            count: { $sum: 1 }
+                        }
+                    }
                 ]).toArray();
 
-                const totalCount = totals[0]?.totalCount || 0;
-                const totalDonateAmount = totals[0]?.totalDonateAmount || 0;
+                const totalAmount = totals[0]?.totalAmount || 0;
+                const totalQuantity = totals[0]?.totalQuantity || 0;
+                const totalCount = totals[0]?.count || 0;
 
                 // full data (no pagination)
-                const data = await donorCollections
+                const data = await donationCollections
                     .find(query)
                     .sort({ _id: -1 })
                     .toArray();
 
-                res.send({ data, totalCount, totalDonateAmount });
-            } catch (err) {
-                console.error("Export Donor List Error:", err);
+                res.send({ data, totalAmount, totalQuantity, totalCount });
+            } catch (error) {
+                console.error("Export Donation List Error:", error);
                 res.status(500).json({ message: "Internal server error" });
             }
         });
