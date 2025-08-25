@@ -297,10 +297,11 @@ async function run() {
             try {
                 const donor = await donorCollections.findOne({ donorId });
                 if (!donor) return res.json({ message: "Donor not found" });
+                const address = await addressCollections.find().toArray();
 
                 res.send({
                     donorName: donor.donorName,
-                    address: donor.donorAddress,
+                    address: address,
                     phone: donor.donorContact,
                 });
             } catch (error) {
@@ -434,7 +435,7 @@ async function run() {
                 const categories = await donationCollections.distinct("incomeCategory", {
                     incomeCategory: { $exists: true, $ne: "" },
                 });
-                const unit = await donationCollections.distinct("unit", {
+                const unit = await unitCollections.distinct("unit", {
                     unit: { $exists: true, $ne: "" },
                 });
                 const paymentOptions = await donationCollections.distinct("paymentOption", {
@@ -1056,6 +1057,9 @@ async function run() {
             try {
                 const {
                     date,           // "DD.MMM.YYYY"
+                    donorName,
+                    address,
+                    phone,
                     amount,
                     quantity,
                     incomeCategory,
@@ -1097,6 +1101,9 @@ async function run() {
                     $set.quantity = numQ;
                 }
 
+                if (donorName !== undefined) $set.donorName = String(donorName);
+                if (address !== undefined) $set.address = String(address);
+                if (phone !== undefined) $set.phone = String(phone);
                 if (incomeCategory !== undefined) $set.incomeCategory = String(incomeCategory);
                 if (unit !== undefined) $set.unit = String(unit);
                 if (paymentOption !== undefined) $set.paymentOption = String(paymentOption);
@@ -1112,6 +1119,11 @@ async function run() {
                     { _id: new ObjectId(id) },
                     { $set }
                 );
+
+                const existDonor = await donorCollections.findOne({donorId: new ObjectId(id).donorId});
+                if(existDonor){
+                    // here we need to donor name, address and mobile, also we need to increase/decrease donateAmount base on edited amount.
+                }
 
                 return res.send({ modifiedCount: result.modifiedCount });
             } catch (err) {
@@ -1240,6 +1252,12 @@ async function run() {
 
         // Map UI 'kind' to collection + key + where it's used (for safe rename/delete)
         const metaKindMap = {
+            addresses: {
+                coll: addressCollections,
+                key: "address",
+                // No rename propagation target for addresses (leave usage undefined)
+            },
+
             incomeCategories: {
                 coll: incomeCategoriesCollections,
                 key: "category",
